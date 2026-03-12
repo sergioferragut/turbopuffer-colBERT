@@ -154,7 +154,7 @@ def _load_state_dict(ckpt_dir: str, device: str) -> dict:
         return load_file(safetensors_path, device=device)
 
     if os.path.exists(pytorch_path):
-        return torch.load(pytorch_path, map_location=device)
+        return torch.load(pytorch_path, map_location=device, weights_only=True)
 
     raise FileNotFoundError(
         f"No model weights found in {ckpt_dir}. "

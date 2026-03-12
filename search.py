@@ -155,21 +155,32 @@ def dense_search(
     # Encode query as a single 768-dim mean-pooled vector.
     emb = encoder.encode_dense([query])[0]  # shape: (768,)
 
+    # Over-fetch to account for multiple chunks per document — after
+    # deduplication we need at least top_k unique doc_ids remaining.
     response = ns.query(
         rank_by=("vector", "ANN", emb.tolist()),
-        top_k=top_k,
+        top_k=top_k * 5,
         include_attributes=["doc_id"],
     )
 
     if response.rows is None:
         return []
 
+    # Deduplicate by doc_id, keeping the highest-scoring chunk per document.
+    best: dict[str, float] = {}
+    for row in response.rows:
+        doc_id = str(row["doc_id"])
+        score = 1.0 - float(row["$dist"])
+        if doc_id not in best or score > best[doc_id]:
+            best[doc_id] = score
+
+    ranked = sorted(best.items(), key=lambda x: x[1], reverse=True)
     return [
         {
-            "doc_id": row["doc_id"],
-            "score": round(1.0 - float(row["$dist"]), 4),
-            "text": doc_store.get(str(row["doc_id"]), ""),
+            "doc_id": doc_id,
+            "score": round(score, 4),
+            "text": doc_store.get(doc_id, ""),
         }
-        for row in response.rows
+        for doc_id, score in ranked[:top_k]
     ]
 
