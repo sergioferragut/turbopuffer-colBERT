@@ -14,8 +14,10 @@ export TURBOPUFFER_REGION=gcp-us-central1   # adjust to your region
 
 | File | Purpose |
 |------|---------|
+| `config.py` | turbopuffer client from env vars |
+| `dataset_loaders.py` | Dataset loaders for Quora and SQuAD → common `DatasetConfig` |
 | `encoder.py` | `ColBERTEncoder` — token-level and dense encoding |
-| `index.py` | Load Quora dataset → index both namespaces |
+| `index.py` | Chunk documents and index both namespaces |
 | `search.py` | `late_interaction_search` and `dense_search` |
 | `evaluate.py` | Recall@10 and latency comparison |
 
@@ -24,20 +26,33 @@ export TURBOPUFFER_REGION=gcp-us-central1   # adjust to your region
 **Step 1: Index** (~10–30 min on CPU, depending on hardware)
 
 ```bash
-python index.py
+python index.py --dataset quora   # default
+python index.py --dataset squad
 ```
 
-Creates two turbopuffer namespaces:
-- `late-interaction-quora` — ~300K token rows (128-dim ColBERT embeddings)
-- `dense-baseline-quora` — ~5K document rows (768-dim mean-pool BERT)
+Long documents are split into overlapping 120-word chunks before indexing.
+Creates two turbopuffer namespaces per dataset:
+
+| Namespace | Rows | Dims |
+|-----------|------|------|
+| `late-interaction-quora` | ~185K token rows | 128-dim ColBERT |
+| `dense-baseline-quora` | ~9.9K chunk rows | 768-dim BERT |
+| `late-interaction-squad` | ~293K token rows | 128-dim ColBERT |
+| `dense-baseline-squad` | ~2.6K chunk rows | 768-dim BERT |
 
 **Step 2: Evaluate**
 
 ```bash
-python evaluate.py
+python evaluate.py --dataset quora
+python evaluate.py --dataset squad
 ```
 
-Runs Recall@10 and latency benchmarks over 50 sampled duplicate pairs.
+Runs Recall@10 and latency benchmarks over 50 sampled query/document pairs.
+
+| Dataset | Dense Recall@10 | Late Interaction Recall@10 |
+|---------|-----------------|---------------------------|
+| Quora (18.8 tokens/doc) | 0.940 | **0.960** |
+| SQuAD (129.7 tokens/doc) | 0.880 | **0.980** |
 
 **Interactive search**
 
@@ -55,8 +70,9 @@ for r in results:
 
 ## How It Works
 
-Each document is encoded into one 128-dim vector per token (ColBERT). These are
-stored as individual turbopuffer rows keyed by `doc_id`. At query time:
+Long documents are split into overlapping word-level chunks. Each chunk is encoded
+into one 128-dim vector per token (ColBERT). All chunks share the parent `doc_id`,
+so MaxSim aggregation across chunks is automatic. At query time:
 
 1. Encode the query → Q token vectors
 2. ANN-search turbopuffer for each query token (batched via `multi_query`, 16/call)

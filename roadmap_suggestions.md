@@ -9,9 +9,10 @@ Internal proposal — turbopuffer engineering
 Late interaction models (ColBERT, ColPali, ColQwen2) are gaining serious traction.
 ColBERT is the go-to for text; ColPali is landing in multimodal search pipelines;
 enterprise customers in legal and biomedical are asking about this pattern by name.
-The current turbopuffer workaround — one row per token, client-side MaxSim, N API
-calls per query — works, but it ships friction to the customer: non-obvious schema
-design, bespoke reranking code, and latency that scales with query token count.
+The current turbopuffer workaround — one row per token, client-side MaxSim, up to 2
+API calls per query via `multi_query` (capped at 16 sub-queries) — works, but it
+ships friction to the customer: non-obvious schema design, bespoke reranking code,
+and latency that scales with query token count above the 16-query limit.
 This proposal outlines five concrete changes, from a one-sprint API addition to a
 longer-term architectural investment, that would make turbopuffer the obvious home
 for late interaction workloads.
@@ -22,10 +23,11 @@ for late interaction workloads.
 
 A customer implementing late interaction today must:
 
-1. **Issue N separate queries per search** — one per query token vector. A typical
-   ColBERT query produces 15–30 token embeddings. That's 15–30 turbopuffer round
-   trips per user query, serialized or with client-managed concurrency. Latency
-   multiplies with query length. There is no server-side batching primitive.
+1. **Issue multiple queries per search** — one per query token vector. A typical
+   ColBERT query produces 15–32 token embeddings. `ns.multi_query()` batches up to
+   16 sub-queries per round trip, so a 32-token query still requires 2 API calls.
+   Queries under 16 tokens fit in 1 call; longer queries need client-side batching
+   loops. Latency scales with query length beyond the 16-query cap.
 
 2. **Implement MaxSim themselves** — after collecting ANN results, every customer
    writes their own aggregation loop: group by doc_id, take max sim per query token,
@@ -45,8 +47,11 @@ A customer implementing late interaction today must:
 
 5. **Receive top-K token rows, not top-K documents** — turbopuffer's query API is
    vector-first. Returning the top-10 *documents* natively is not possible today;
-   customers must over-fetch token rows and deduplicate. The `limit.per` diversification
-   parameter helps but isn't the right abstraction for this use case.
+   customers must over-fetch token rows and deduplicate. `limit.per` exists as a
+   diversification primitive (`{"total": N, "per": {"attributes": ["doc_id"], "limit": 1}}`)
+   but returns a 400 error when used with `rank_by=("vector", "ANN", ...)` — it is
+   only supported on filter/scan queries. Customers are left to over-fetch and
+   deduplicate in client code.
 
 ---
 
@@ -54,38 +59,44 @@ A customer implementing late interaction today must:
 
 ### Proposal 1: Batch Vector Query (Multi-Vector ANN)
 
-**Problem:** N round trips per query, one per query token vector.
+**Problem:** ColBERT queries produce up to 32 token vectors. `ns.multi_query()` is
+capped at 16 sub-queries per call, requiring 2 round trips for long queries and
+a client-side batching loop.
 
-**Proposed API:**
+**Current API (already working, just capped at 16):**
 
 ```python
-# Today: N round trips (1 per query token)
-results = []
-for q_vec in query_token_vectors:
-    results.append(ns.query(
-        rank_by=["vector", "ANN", q_vec],
-        top_k=50,
-        include_attributes=["doc_id"],
-    ))
+# Today: up to 2 round trips for ColBERT (ceil(32/16) = 2)
+for batch_start in range(0, len(query_token_vectors), 16):
+    batch = query_token_vectors[batch_start : batch_start + 16]
+    response = ns.multi_query(
+        queries=[
+            {
+                "rank_by": ("vector", "ANN", vec.tolist()),
+                "top_k": 50,
+                "include_attributes": ["doc_id"],
+            }
+            for vec in batch
+        ]
+    )
 
-# Proposed: 1 round trip
-response = ns.query(
+# Proposed: 1 round trip, limit raised to 64
+response = ns.multi_query(
     queries=[
         {
-            "rank_by": ["vector", "ANN", q_vec],
+            "rank_by": ("vector", "ANN", vec.tolist()),
             "top_k": 50,
             "include_attributes": ["doc_id"],
         }
-        for q_vec in query_token_vectors
+        for vec in query_token_vectors   # up to 32 vectors, fits in 1 call
     ]
 )
 # response.results[i] → sub-results for query_token_vectors[i]
 ```
 
-This is already supported as the `queries` multi-query parameter, capped at 16
-sub-queries. The gap: ColBERT queries often have 20–32 token vectors. Raising the
-limit from 16 to 64 (or removing it for same-namespace queries) eliminates the
-need for client-side batching loops entirely.
+The multi-query API already exists. Raising the limit from 16 to 64 (or removing
+it for same-namespace queries) eliminates the client-side batching loop and the
+second round trip entirely.
 
 **Implementation complexity:** Low. The `queries` parameter already exists. This
 is a limit increase and documentation improvement, not a new feature.
@@ -101,7 +112,7 @@ and top-K document extraction themselves. No first-class document concept exists
 
 ```python
 # Write: one logical document with N token vectors
-ns.upsert(
+ns.write(
     upsert_rows=[
         {
             "id": "doc_001",                               # document-level ID
@@ -149,30 +160,45 @@ sign, missing normalization) and degrade ranking quality without error.
 
 **Proposed API:**
 
-A rerank step that runs after standard ANN retrieval, before results are returned:
+Extend `ns.multi_query()` with two new parameters: `rerank` and `top_k_after_rerank`.
+The query token vectors are already in the request — the server unions candidates
+across all sub-queries, applies MaxSim, and returns final top-K documents. No
+additional input required from the caller.
 
 ```python
-results = ns.query(
-    rank_by=["vector", "ANN", mean_query_vector],   # ANN over mean-pooled query
-    top_k=200,                                       # wider candidate set
+response = ns.multi_query(
+    queries=[
+        {
+            "rank_by": ("vector", "ANN", vec.tolist()),
+            "top_k": 100,                            # candidate pool per token
+            "include_attributes": ["doc_id"],
+        }
+        for vec in query_token_vectors               # the full token matrix
+    ],
     rerank={
         "method": "maxsim",
-        "query_vectors": query_token_vectors,        # full token matrix
+        "group_by": "doc_id",                        # union candidates, score per doc
     },
-    top_k_after_rerank=10,                           # return final top-10
-    include_attributes=["doc_id", "text"],
+    top_k_after_rerank=10,                           # return final top-10 documents
 )
+# response.results → top-10 documents ranked by MaxSim score
 ```
 
-This requires that token vectors for candidate documents be accessible server-side.
-One approach: fetch token rows for the top-200 candidate doc_ids, run MaxSim in the
-query handler, return final top-10. Storage layout stays the same as today.
+The server already has everything it needs: the full set of query token vectors
+(in the sub-queries), the ANN candidates with their `doc_id` attributes, and the
+distances. MaxSim is just: for each `doc_id`, for each query token, take the
+minimum distance seen across all token rows for that doc, then sum the converted
+similarities. No mean-vector computation, no extra round trip, no client aggregation.
 
-**Implementation complexity:** Medium. The ANN pass is standard. The reranking step
-is a filtered fetch (get all token rows for N doc_ids) plus a dot-product loop —
-both straightforward. The main design question is how `query_vectors` are passed
-(inline in the request body vs pre-stored) and how the fetch-by-doc_id step
-performs at scale.
+Storage layout stays the same as today. The reranking step is a union of candidate
+sets (one per sub-query) followed by a dot-product loop — both cheap operations over
+a small in-memory set.
+
+**Implementation complexity:** Medium. The ANN passes are standard. The reranking
+step is a post-processing aggregation in the query handler. The main design question
+is the `group_by` attribute name (must be `doc_id` or a configurable field) and
+whether the server re-fetches token vectors for candidate docs or uses the distances
+already returned by the ANN pass (distances are sufficient for MaxSim; no re-fetch needed).
 
 This proposal ships faster than Proposal 2 and delivers the highest immediate
 customer value: correct, consistent MaxSim without any client code.
@@ -189,10 +215,11 @@ per-byte penalty that could be avoided with a namespace-level dim declaration.
 
 ```python
 # Declare small-dim namespace at creation time
-ns = tpuf.Namespace("late-interaction-quora")
-ns.upsert(
-    ...,
+ns = client.namespace("late-interaction-quora")
+ns.write(
+    upsert_rows=[...],
     schema={"vector": {"type": "f16", "dimensions": 128}},
+    distance_metric="cosine_distance",
 )
 ```
 
@@ -212,9 +239,11 @@ beyond the schema declaration.
 
 ### Proposal 5: Multi-Vector Cost Estimator in Docs and Dashboard
 
-**Problem:** Customers don't realize their storage costs will be 10–15× higher for
-late interaction until they've already indexed. This creates billing surprises and
-support tickets.
+**Problem:** Customers don't realize their storage costs can be 3–22× higher for
+late interaction until they've already indexed. The multiplier scales linearly with
+average tokens per document: `avg_tokens × (128/768)`. Short-document corpora
+(~19 tokens/doc) see ~3× overhead; long-document corpora (~130 tokens/doc) see ~22×.
+This creates billing surprises and support tickets.
 
 **Proposed addition to docs:**
 
@@ -231,7 +260,11 @@ Storage estimate for late interaction:
   Attribute bytes (doc_id, token_pos): ~72 MB
 
   Estimated storage: ~1.6 GB/month
+  Storage vs. dense baseline: ~10× (formula: avg_tokens × 128/768)
   At current rate:   $X.XX/month  ← link to pricing page
+
+  Note: storage ratio ranges from ~3× (short docs, 19 tokens) to
+  ~22× (long docs, 130 tokens). Always ask for avg tokens/doc.
 ```
 
 Add an interactive version to the dashboard namespace detail page. Inputs: document
